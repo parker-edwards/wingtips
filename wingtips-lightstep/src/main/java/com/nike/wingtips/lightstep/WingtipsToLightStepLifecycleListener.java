@@ -1,129 +1,203 @@
-package com.nike.wingtips.zipkin2.util;
+package com.nike.wingtips.lightstep;
 
 import com.nike.wingtips.Span;
-import com.nike.wingtips.Span.SpanPurpose;
-import com.nike.wingtips.Span.TimestampedAnnotation;
 import com.nike.wingtips.TraceAndSpanIdGenerator;
+import com.nike.wingtips.lifecyclelistener.SpanLifecycleListener;
+
+import com.lightstep.tracer.jre.JRETracer;
+import com.lightstep.tracer.shared.SpanBuilder;
+import com.lightstep.tracer.shared.SpanContext;
 
 import org.apache.commons.codec.digest.DigestUtils;
+import org.jetbrains.annotations.NotNull;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
-import zipkin2.Endpoint;
+import static java.util.Objects.requireNonNull;
 
 /**
- * Default implementation of {@link WingtipsToZipkinSpanConverter} that knows how to convert a Wingtips span to a
- * Zipkin span.
+ * A {@link SpanLifecycleListener} that converts Wingtips {@link Span}s to [LightStep implementation of] an OpenTracing
+ * {@link io.opentracing.Span}, and sends that data to the LightStep Satellites via
+ * the {@link JRETracer}.
  *
- * <p>NOTE: Although Wingtips encourages conforming to the
- * <a href="https://github.com/openzipkin/b3-propagation">Zipkin B3</a> specification for IDs (16 character/64 bit
- * lowercase hexadecimal values, with an option for 32 char/128 bit lowerhex for trace IDs), Wingtips itself treats
- * IDs as strings - you can pass any string for IDs and Wingtips will happily handle it. There's no enforcement of
- * any specific format in Wingtips. This works ok as long as you don't need to integrate with another system that
- * has more strict requirements on ID formats, i.e. when you want to send Wingtips span data to Zipkin. But if you do
- * need to integrate with Zipkin for visualization of your traces, *and* you can't force your callers to use the proper
- * ID format, then you'd be in trouble. This class handles this situation by giving you an option to "sanitize" IDs
- * if necessary. You can enable sanitization by using the alternate {@link
- * WingtipsToZipkinSpanConverterDefaultImpl#WingtipsToZipkinSpanConverterDefaultImpl(boolean)} constructor and passing
- * true. If you enable sanitization and this class sees a badly formatted ID, then it will convert it to the proper
- * lowerhex format, add a {@link #SANITIZED_ID_LOG_MSG log message} with the original and sanitized IDs for correlation,
- * and add a Zipkin {@code invalid.[trace/span/parent]_id} tag with a value of the original ID. The sanitization is
- * done in a deterministic way so that the same original ID input will always be sanitized into the same output.
+ * We're adapting some of the prior work built in the Wingtips Zipkin2 plugin to handle conversion of span/trace/parent
+ * IDs as well as frequency gates for exception logging.
  *
- * @author Nic Munroe
+ * Required options used in the constructor are the LightStep access token (generated in project settings within
+ * LightStep), service name (which will be assigned to all spans), Satellite URL and Satellite Port, which should both
+ * reflect the address for the load balancer in front of the LightStep Satellites.
+ *
+ * @author parker@lightstep.com
  */
-@SuppressWarnings("WeakerAccess")
-public class WingtipsToZipkinSpanConverterDefaultImpl implements WingtipsToZipkinSpanConverter {
 
-    private final Logger logger = LoggerFactory.getLogger(this.getClass());
+public class WingtipsToLightStepLifecycleListener implements SpanLifecycleListener {
+
+    // we borrowed the logging and exception log rate limiting from the Zipkin plugin.
+    private final Logger lightStepToWingtipsLogger =
+        LoggerFactory.getLogger("LIGHTSTEP_SPAN_CONVERSION_OR_HANDLING_ERROR");
 
     private static final String SANITIZED_ID_LOG_MSG = "Detected invalid ID format. orig_id={}, sanitized_id={}";
 
-    protected final boolean enableIdSanitization;
+    private final AtomicLong spanHandlingErrorCounter = new AtomicLong(0);
+    private long lastSpanHandlingErrorLogTimeEpochMillis = 0;
+    private static final long MIN_SPAN_HANDLING_ERROR_LOG_INTERVAL_MILLIS = TimeUnit.SECONDS.toMillis(60);
 
-    public WingtipsToZipkinSpanConverterDefaultImpl() {
-        // Disable ID sanitization by default - this should be something that users consciously opt-in for.
-        this(false);
+    protected final JRETracer tracer;
+
+    // Basic constructor which requires values to configure tracer and point span traffic from the transport library
+    // to the LightStep Satellites.
+    public WingtipsToLightStepLifecycleListener(
+        @NotNull String serviceName,
+        @NotNull String accessToken,
+        @NotNull String satelliteUrl,
+        int satellitePort
+    ) {
+        this(buildJreTracerFromOptions(serviceName, accessToken, satelliteUrl, satellitePort));
     }
 
-    public WingtipsToZipkinSpanConverterDefaultImpl(boolean enableIdSanitization) {
-        this.enableIdSanitization = enableIdSanitization;
+    @SuppressWarnings("ResultOfMethodCallIgnored")
+    public WingtipsToLightStepLifecycleListener(@NotNull JRETracer tracer) {
+        requireNonNull(tracer, "tracer cannot be null.");
+        this.tracer = tracer;
+    }
+
+    @SuppressWarnings("ResultOfMethodCallIgnored")
+    private static @NotNull JRETracer buildJreTracerFromOptions(
+        @NotNull String serviceName,
+        @NotNull String accessToken,
+        @NotNull String satelliteUrl,
+        int satellitePort
+    ) {
+        requireNonNull(serviceName, "serviceName cannot be null.");
+        requireNonNull(accessToken, "accessToken cannot be null.");
+        requireNonNull(satelliteUrl, "satelliteUrl cannot be null.");
+
+        try {
+            return new JRETracer(
+                new com.lightstep.tracer.shared.Options.OptionsBuilder()
+                    .withAccessToken(accessToken)
+                    .withComponentName(serviceName)
+                    .withCollectorHost(satelliteUrl)
+                    .withCollectorPort(satellitePort)
+                    .withVerbosity(4)
+                    .build()
+            );
+        } catch (Exception ex) {
+            throw new RuntimeException("There was an error initializing the LightStep tracer.", ex);
+        }
     }
 
     @Override
-    public zipkin2.Span convertWingtipsSpanToZipkinSpan(Span wingtipsSpan, Endpoint zipkinEndpoint) {
-        long durationMicros = TimeUnit.NANOSECONDS.toMicros(wingtipsSpan.getDurationNanos());
-
-        String spanId = sanitizeIdIfNecessary(wingtipsSpan.getSpanId(), false);
-        String traceId = sanitizeIdIfNecessary(wingtipsSpan.getTraceId(), true);
-        String parentId = sanitizeIdIfNecessary(wingtipsSpan.getParentSpanId(), false);
-
-        final zipkin2.Span.Builder spanBuilder = zipkin2.Span
-            .newBuilder()
-            .id(spanId)
-            .name(wingtipsSpan.getSpanName())
-            .parentId(parentId)
-            .traceId(traceId)
-            .timestamp(wingtipsSpan.getSpanStartTimeEpochMicros())
-            .duration(durationMicros)
-            .localEndpoint(zipkinEndpoint)
-            .kind(determineZipkinKind(wingtipsSpan));
-        
-        // Iterate over existing wingtips tags and add them to the zipkin builder.
-        for (Map.Entry<String, String> tagEntry : wingtipsSpan.getTags().entrySet()) {
-            spanBuilder.putTag(tagEntry.getKey(), tagEntry.getValue());
-        }
-            
-        if (!spanId.equals(wingtipsSpan.getSpanId())) {
-            spanBuilder.putTag("invalid.span_id", wingtipsSpan.getSpanId());
-        }
-        if (!traceId.equals(wingtipsSpan.getTraceId())) {
-            spanBuilder.putTag("invalid.trace_id", wingtipsSpan.getTraceId());
-        }
-        if (parentId != null && !parentId.equals(wingtipsSpan.getParentSpanId())) {
-            spanBuilder.putTag("invalid.parent_id", wingtipsSpan.getParentSpanId());
-        }
-
-        // Iterate over existing wingtips annotations and add them to the zipkin builder.
-        for (TimestampedAnnotation wingtipsAnnotation : wingtipsSpan.getTimestampedAnnotations()) {
-            spanBuilder.addAnnotation(wingtipsAnnotation.getTimestampEpochMicros(), wingtipsAnnotation.getValue());
-        }
-        
-        return spanBuilder.build();
+    public void spanSampled(Span wingtipsSpan) {
+        // Do nothing
     }
 
-    @SuppressWarnings("WeakerAccess")
-    protected zipkin2.Span.Kind determineZipkinKind(Span wingtipsSpan) {
-        SpanPurpose wtsp = wingtipsSpan.getSpanPurpose();
+    @Override
+    public void spanStarted(Span wingtipsSpan) {
+        // Do nothing
+    }
 
-        // Clunky if checks necessary to avoid code coverage gaps with a switch statement
-        //      due to unreachable default case. :(
-        if (SpanPurpose.SERVER == wtsp) {
-            return zipkin2.Span.Kind.SERVER;
-        }
-        else if (SpanPurpose.CLIENT == wtsp) {
-            return zipkin2.Span.Kind.CLIENT;
-        }
-        else if (SpanPurpose.LOCAL_ONLY == wtsp || SpanPurpose.UNKNOWN == wtsp) {
-            // No Zipkin Kind associated with these SpanPurposes.
-            return null;
-        }
-        else {
-            // This case should technically be impossible, but in case it happens we'll log a warning and default to
-            //      no Zipkin kind.
-            logger.warn("Unhandled SpanPurpose type: {}", String.valueOf(wtsp));
-            return null;
+    @Override
+    public void spanCompleted(Span wingtipsSpan) {
+        try {
+            String operationName = wingtipsSpan.getSpanName();
+            long startTimeMicros = wingtipsSpan.getSpanStartTimeEpochMicros();
+
+            // Given we should only be in this method on span completion, we are not going to wrap this conversion in a
+            // try/catch. duration should be set on the Wingtips span.
+            long durationMicros = TimeUnit.NANOSECONDS.toMicros(wingtipsSpan.getDurationNanos());
+            long stopTimeMicros = startTimeMicros + durationMicros;
+
+            // Sanitize the wingtips trace/span/parent IDs if necessary. This guarantees we can convert them to
+            //      longs as required by LightStep.
+            String wtSanitizedSpanId = sanitizeIdIfNecessary(wingtipsSpan.getSpanId(), false);
+            String wtSanitizedTraceId = sanitizeIdIfNecessary(wingtipsSpan.getTraceId(), true);
+            String wtSanitizedParentId = sanitizeIdIfNecessary(wingtipsSpan.getParentSpanId(), false);
+
+            // Handle the common SpanBuilder settings.
+            SpanBuilder lsSpanBuilder = (SpanBuilder) (
+                tracer.buildSpan(operationName)
+                      .withStartTimestamp(wingtipsSpan.getSpanStartTimeEpochMicros())
+                      .ignoreActiveSpan()
+                      .withTag("wingtips.span_id", wingtipsSpan.getSpanId())
+                      .withTag("wingtips.trace_id", wingtipsSpan.getTraceId())
+                      .withTag("wingtips.parent_id", String.valueOf(wingtipsSpan.getParentSpanId()))
+                      .withTag("span.type", wingtipsSpan.getSpanPurpose().name())
+            );
+
+            // Force the LightStep span to have a Trace ID and Span ID matching the Wingtips span.
+            //      NOTE: LightStep requires Ids to be longs, so we convert the sanitized wingtips trace/span IDs.
+            long lsSpanId = TraceAndSpanIdGenerator.unsignedLowerHexStringToLong(wtSanitizedSpanId);
+            long lsTraceId = TraceAndSpanIdGenerator.unsignedLowerHexStringToLong(wtSanitizedTraceId);
+            lsSpanBuilder.withTraceIdAndSpanId(lsTraceId, lsSpanId);
+
+            // Handle the parent ID / parent context SpanBuilder settings.
+            if (wingtipsSpan.getParentSpanId() != null) {
+                long lsParentId = TraceAndSpanIdGenerator.unsignedLowerHexStringToLong(wtSanitizedParentId);
+
+                SpanContext lsSpanContext = new SpanContext(lsTraceId, lsParentId);
+
+                lsSpanBuilder = (SpanBuilder)(lsSpanBuilder.asChildOf(lsSpanContext));
+            }
+
+            // Start the OT span and set logs and tags from the wingtips span.
+            io.opentracing.Span lsSpan = lsSpanBuilder.start();
+
+            for (Span.TimestampedAnnotation wingtipsAnnotation : wingtipsSpan.getTimestampedAnnotations()) {
+                lsSpan.log(wingtipsAnnotation.getTimestampEpochMicros(), wingtipsAnnotation.getValue());
+            }
+
+            for (Map.Entry<String, String> wtTag : wingtipsSpan.getTags().entrySet()) {
+                lsSpan.setTag(wtTag.getKey(), wtTag.getValue());
+            }
+
+            // Add some custom boolean tags if any of the IDs had to be sanitized. The raw unsanitized ID will be
+            //      available via the wingtips.*_id tags.
+            if (!wtSanitizedSpanId.equals(wingtipsSpan.getSpanId())) {
+                lsSpan.setTag("wingtips.span_id.invalid", true);
+            }
+            if (!wtSanitizedTraceId.equals(wingtipsSpan.getTraceId())) {
+                lsSpan.setTag("wingtips.trace_id.invalid", true);
+            }
+            if (wtSanitizedParentId != null && !wtSanitizedParentId.equals(wingtipsSpan.getParentSpanId())) {
+                lsSpan.setTag("wingtips.parent_id.invalid", true);
+            }
+
+            // on finish, the tracer library initialized on the creation of this listener will cache and transport the span
+            // data to the LightStep Satellite.
+            lsSpan.finish(stopTimeMicros);
+        } catch (Exception ex) {
+            long currentBadSpanCount = spanHandlingErrorCounter.incrementAndGet();
+            // Adopted from WingtipsToZipkinLifecycleListener from Wingtips-Zipkin2 plugin.
+            // Only log once every MIN_SPAN_HANDLING_ERROR_LOG_INTERVAL_MILLIS time interval to prevent log spam from a
+            // malicious (or broken) caller.
+            long currentTimeMillis = System.currentTimeMillis();
+            long timeSinceLastLogMsgMillis = currentTimeMillis - lastSpanHandlingErrorLogTimeEpochMillis;
+
+            if (timeSinceLastLogMsgMillis >= MIN_SPAN_HANDLING_ERROR_LOG_INTERVAL_MILLIS) {
+                // We're not synchronizing the read and write to lastSpanHandlingErrorLogTimeEpochMillis, and that's ok.
+                // If we get a few extra log messages due to a race condition it's not the end of the world - we're
+                // still satisfying the goal of not allowing a malicious caller to endlessly spam the logs.
+                lastSpanHandlingErrorLogTimeEpochMillis = currentTimeMillis;
+
+                lightStepToWingtipsLogger.warn(
+                        "There have been {} spans that were not LightStep compatible, or that experienced an error "
+                        + "during span handling. Latest example: "
+                        + "wingtips_span_with_error=\"{}\", conversion_or_handling_error=\"{}\"",
+                        currentBadSpanCount, wingtipsSpan.toKeyValueString(), ex.toString()
+                );
+            }
         }
     }
 
+    // TODO: The sanitization logic is a copy/paste from WingtipsToZipkinSpanConverterDefaultImpl. We should figure out
+    //       a way to share the code. We could move it to wingtips-core, but this uses DigestUtils, and we don't want
+    //       to add that dependency to wingtips-core.
     protected String sanitizeIdIfNecessary(final String originalId, final boolean allow128Bit) {
-        if (!enableIdSanitization) {
-            return originalId;
-        }
-
         if (originalId == null) {
             return null;
         }
@@ -137,7 +211,7 @@ public class WingtipsToZipkinSpanConverterDefaultImpl implements WingtipsToZipki
                 // It wasn't lowerhex, but it is hex and it is the correct number of chars.
                 //      We can trivially convert to valid lowerhex by lowercasing the ID.
                 String sanitizedId = originalId.toLowerCase();
-                logger.info(SANITIZED_ID_LOG_MSG, originalId, sanitizedId);
+                lightStepToWingtipsLogger.info(SANITIZED_ID_LOG_MSG, originalId, sanitizedId);
                 return sanitizedId;
             }
         }
@@ -146,7 +220,7 @@ public class WingtipsToZipkinSpanConverterDefaultImpl implements WingtipsToZipki
         Long originalIdAsRawLong = attemptToConvertToLong(originalId);
         if (originalIdAsRawLong != null) {
             String sanitizedId = TraceAndSpanIdGenerator.longToUnsignedLowerHexString(originalIdAsRawLong);
-            logger.info(SANITIZED_ID_LOG_MSG, originalId, sanitizedId);
+            lightStepToWingtipsLogger.info(SANITIZED_ID_LOG_MSG, originalId, sanitizedId);
             return sanitizedId;
         }
 
@@ -155,7 +229,7 @@ public class WingtipsToZipkinSpanConverterDefaultImpl implements WingtipsToZipki
         if (allow128Bit) {
             String sanitizedId = attemptToSanitizeAsUuid(originalId);
             if (sanitizedId != null) {
-                logger.info(SANITIZED_ID_LOG_MSG, originalId, sanitizedId);
+                lightStepToWingtipsLogger.info(SANITIZED_ID_LOG_MSG, originalId, sanitizedId);
                 return sanitizedId;
             }
         }
@@ -168,7 +242,7 @@ public class WingtipsToZipkinSpanConverterDefaultImpl implements WingtipsToZipki
         //      https://csrc.nist.gov/csrc/media/publications/fips/180/4/final/documents/fips180-4-draft-aug2014.pdf
         int allowedNumChars = allow128Bit ? 32 : 16;
         String sanitizedId = DigestUtils.sha256Hex(originalId).toLowerCase().substring(0, allowedNumChars);
-        logger.info(SANITIZED_ID_LOG_MSG, originalId, sanitizedId);
+        lightStepToWingtipsLogger.info(SANITIZED_ID_LOG_MSG, originalId, sanitizedId);
         return sanitizedId;
     }
 
@@ -263,7 +337,7 @@ public class WingtipsToZipkinSpanConverterDefaultImpl implements WingtipsToZipki
         }
         catch (final NumberFormatException nfe) {
             // This should never happen, but if it does, return null as it can't be converted to a long.
-            logger.warn(
+            lightStepToWingtipsLogger.warn(
                 "Found digits-based-ID that reached Long.parseLong(id) and failed. "
                 + "This should never happen - please report this to the Wingtips maintainers. "
                 + "invalid_id={}, NumberFormatException={}",

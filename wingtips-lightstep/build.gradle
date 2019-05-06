@@ -1,0 +1,28 @@
+evaluationDependsOn(':')
+
+compileTestJava {
+    sourceCompatibility = JavaVersion.VERSION_1_8
+    targetCompatibility = JavaVersion.VERSION_1_8
+}
+
+dependencies {
+    compile(
+            project(":wingtips-core"),
+            "com.lightstep.tracer:lightstep-tracer-jre:$lightstepTracerVersion",
+            "com.lightstep.tracer:tracer-okhttp:$lightstepHttpVersion",
+            "io.grpc:grpc-netty:$grpcNettyVersion",
+            "io.netty:netty-tcnative-boringssl-static:$nettyTcnativeBoringVersion",
+            "commons-codec:commons-codec:$apacheCommonsCodecVersion",
+    )
+    compileOnly(
+            "org.jetbrains:annotations:$jetbrainsAnnotationsVersion"
+    )
+    testCompile(
+            "org.jetbrains:annotations:$jetbrainsAnnotationsVersion",
+            "junit:junit-dep:$junitVersion",
+            "org.mockito:mockito-core:$mockitoVersion",
+            "org.assertj:assertj-core:$assertJVersion",
+            "com.tngtech.java:junit-dataprovider:$junitDataproviderVersion",
+            "ch.qos.logback:logback-classic:$logbackVersion",
+    )
+}
